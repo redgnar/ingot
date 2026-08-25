@@ -24,7 +24,8 @@ use Opis\JsonSchema\Validator;
  * value inside the validated document.
  *
  * Two keywords come from this library rather than from a draft:
- * `formatMinimum` and `formatMaximum` bound a `"format": "date"` string, which
+ * `formatMinimum` and `formatMaximum` bound a `"format": "date"` or
+ * `"format": "date-time"` string, which
  * standard JSON Schema cannot express at all ({@see DateBoundKeyword}).
  *
  * `additionalProperties` gets one extra step. opis reports it once on the

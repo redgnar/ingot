@@ -11,9 +11,14 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
- * A date range, which standard JSON Schema cannot express: `formatMinimum` and
- * `formatMaximum` beside `"format": "date"`, with the meaning ajv-formats gives
- * them — so one document is enforced the same way here and in a browser.
+ * A range in time, which standard JSON Schema cannot express: `formatMinimum`
+ * and `formatMaximum` beside `"format": "date"` or `"format": "date-time"`, with
+ * the meaning ajv-formats gives them — so one document is enforced the same way
+ * here and in a browser.
+ *
+ * The two formats are compared differently, and the tests below are what pins
+ * that: dates as text, because they sort that way, and date-times as the moments
+ * they name, because an offset means they do not.
  */
 final class DateBoundsTest extends TestCase
 {
@@ -139,9 +144,78 @@ final class DateBoundsTest extends TestCase
         $validator->validate('2026-06-15', $schema);
     }
 
-    public function testABoundBesideAnotherFormatIsRefused(): void
+    public function testABoundThatIsNotEvenAStringIsRefused(): void
     {
-        // GIVEN a bound where string order is not time order
+        // GIVEN a bound written as a number, which is a mistake in the schema
+        // rather than something to compare a date against
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "string", "format": "date", "formatMinimum": 2026}');
+
+        // WHEN / THEN
+        $this->expectException(ParseException::class);
+
+        $validator->validate('2026-06-15', $schema);
+    }
+
+    public function testABoundBesideAFormatThatSaysNothingAboutTimeIsRefused(): void
+    {
+        // GIVEN a bound beside a format these keywords cannot mean anything for
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "string", "format": "email", "formatMinimum": "2026-01-01"}');
+
+        // WHEN
+        $refusal = null;
+
+        try {
+            $validator->validate('someone@example.com', $schema);
+        } catch (ParseException $caught) {
+            $refusal = $caught;
+        }
+
+        // THEN it is refused for the reason it is actually wrong. The bound is a
+        // perfectly good date; what it has no meaning beside is the format, and
+        // saying so is the difference between a fixable message and a puzzle.
+        self::assertInstanceOf(ParseException::class, $refusal);
+        self::assertStringContainsString('only means anything beside', $refusal->getMessage());
+    }
+
+    /**
+     * @return \Generator<string, array{string, string, string}>
+     */
+    public static function malformedBounds(): \Generator
+    {
+        yield 'a date-time where a date belongs' => ['date', '2026-01-01T00:00:00Z', 'YYYY-MM-DD'];
+        yield 'a date where a date-time belongs' => ['date-time', '2026-01-01', 'RFC 3339'];
+    }
+
+    #[DataProvider('malformedBounds')]
+    public function testTheRefusalNamesTheShapeThatWasWanted(string $format, string $bound, string $expected): void
+    {
+        // GIVEN a bound written in the other format's shape
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(\sprintf('{"type": "string", "format": "%s", "formatMinimum": "%s"}', $format, $bound));
+
+        // WHEN
+        $refusal = null;
+
+        try {
+            $validator->validate('2026-06-15', $schema);
+        } catch (ParseException $caught) {
+            $refusal = $caught;
+        }
+
+        // THEN the message asks for the shape this format wants, not the other
+        // one — the two are a sentence apart and swapping them would send
+        // somebody to fix the wrong end of their schema
+        self::assertInstanceOf(ParseException::class, $refusal);
+        self::assertStringContainsString($expected, $refusal->getMessage());
+    }
+
+    public function testADateBoundBesideADateTimeIsRefused(): void
+    {
+        // GIVEN a date where the format asks for a moment: the two are not
+        // interchangeable, and comparing one against the other would quietly
+        // pick a time of day nobody wrote
         $validator = new OpisSchemaValidator();
         $schema = Schema::fromJson('{"type": "string", "format": "date-time", "formatMinimum": "2026-01-01"}');
 
@@ -149,6 +223,97 @@ final class DateBoundsTest extends TestCase
         $this->expectException(ParseException::class);
 
         $validator->validate('2026-01-01T10:00:00Z', $schema);
+    }
+
+    public function testADateTimeBoundShapedRightWithADayThatDoesNotExistIsRefused(): void
+    {
+        // GIVEN a bound that passes for one at a glance
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "string", "format": "date-time", "formatMinimum": "2026-13-01T00:00:00Z"}');
+
+        // WHEN / THEN the shape is not the whole of it: there is no such month,
+        // so there is no moment to compare anything against
+        $this->expectException(ParseException::class);
+
+        $validator->validate('2026-06-15T12:00:00Z', $schema);
+    }
+
+    public function testADateTimeBoundWithoutAnOffsetIsRefused(): void
+    {
+        // GIVEN a bound that names a reading on a wall rather than a moment
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "string", "format": "date-time", "formatMinimum": "2026-01-01T00:00:00"}');
+
+        // WHEN / THEN
+        $this->expectException(ParseException::class);
+
+        $validator->validate('2026-01-01T10:00:00Z', $schema);
+    }
+
+    /**
+     * @return \Generator<string, array{string, string|null}>
+     */
+    public static function moments(): \Generator
+    {
+        yield 'inside the range' => ['2026-06-15T12:00:00Z', null];
+        yield 'the first moment allowed' => ['2026-01-01T00:00:00Z', null];
+        yield 'the last moment allowed' => ['2026-12-31T23:59:59Z', null];
+        yield 'the same moment with a fraction' => ['2026-06-15T12:00:00.250Z', null];
+        yield 'a lowercase t and z, which RFC 3339 allows' => ['2026-06-15t12:00:00z', null];
+
+        yield 'a second too early' => ['2025-12-31T23:59:59Z', 'schema.formatMinimum'];
+        yield 'a second too late' => ['2027-01-01T00:00:00Z', 'schema.formatMaximum'];
+
+        // The whole reason a date-time is not compared as text. As strings,
+        // "2026-01-01T00:30:00+01:00" sorts after the lower bound; as moments it
+        // is half an hour before it, and it is the moment that counts.
+        yield 'inside the range by the clock, outside it by the offset' => ['2026-01-01T00:30:00+01:00', 'schema.formatMinimum'];
+        // And the other way about: text says it is a year too late, the offset
+        // says it is the last second of the range.
+        yield 'outside the range by the clock, inside it by the offset' => ['2027-01-01T00:59:59+01:00', null];
+
+        yield 'a date where a moment belongs' => ['2026-06-15', 'schema.format'];
+        yield 'not a moment at all' => ['tomorrow', 'schema.format'];
+        // Opis reads `date-time` more loosely than RFC 3339 does and lets a
+        // string with no offset through. There is no moment in it to compare —
+        // 12:00 where? — so this says nothing rather than guessing a zone. A
+        // schema that needs the offset says so itself, with a `pattern` beside
+        // the format; that is the document's business and not this keyword's.
+        yield 'a reading on a wall, with no offset to place it' => ['2026-06-15T12:00:00', null];
+        yield 'and one that would be out of range if it were a moment' => ['2099-06-15T12:00:00', null];
+        yield 'a month that does not exist' => ['2026-13-01T00:00:00Z', 'schema.format'];
+    }
+
+    #[DataProvider('moments')]
+    public function testARangeOfMomentsIsEnforced(string $moment, ?string $code): void
+    {
+        // GIVEN a schema bounding a moment on both sides
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{
+            "type": "object",
+            "properties": {
+                "when": {
+                    "type": "string",
+                    "format": "date-time",
+                    "formatMinimum": "2026-01-01T00:00:00Z",
+                    "formatMaximum": "2026-12-31T23:59:59Z"
+                }
+            }
+        }');
+
+        // WHEN
+        $report = $validator->validate(self::document($moment), $schema);
+
+        // THEN
+        if ($code === null) {
+            self::assertTrue($report->isEmpty(), \sprintf('Expected "%s" to be accepted.', $moment));
+
+            return;
+        }
+
+        self::assertFalse($report->isEmpty(), \sprintf('Expected "%s" to be refused.', $moment));
+        self::assertSame($code, $report->errors[0]->code);
+        self::assertSame('/when', $report->errors[0]->pointer->toString());
     }
 
     private static function document(string $date): object

@@ -225,14 +225,46 @@ final class DateBoundsTest extends TestCase
         $validator->validate('2026-01-01T10:00:00Z', $schema);
     }
 
-    public function testADateTimeBoundShapedRightWithADayThatDoesNotExistIsRefused(): void
+    /**
+     * @return \Generator<string, array{string}>
+     */
+    public static function daysThatDoNotExist(): \Generator
+    {
+        yield 'a thirteenth month' => ['2026-13-01T00:00:00Z'];
+        // The one PHP does not refuse: it rolls this over into the second of
+        // March and would compare against a moment nobody wrote.
+        yield 'the thirtieth of February' => ['2026-02-30T00:00:00Z'];
+        yield 'a leap day in a year that has none' => ['2026-02-29T00:00:00Z'];
+        yield 'a thirty-first of April' => ['2026-04-31T12:00:00+02:00'];
+        // Shaped right, day exists, and still no moment: the hour, the minute
+        // and the offset each have a range of their own.
+        yield 'an offset no zone has' => ['2026-06-15T12:00:00+99:00'];
+        yield 'a twenty-fifth hour' => ['2026-06-15T25:00:00Z'];
+        yield 'a sixtieth minute' => ['2026-06-15T12:60:00Z'];
+    }
+
+    public function testALeapDayInAYearThatHasOneIsAPerfectlyGoodBound(): void
+    {
+        // GIVEN a bound on the one day that exists only every fourth year. Which
+        // year it is decides whether the day is there at all, so this is what
+        // says the year is being read as the year.
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "string", "format": "date-time", "formatMinimum": "2028-02-29T00:00:00Z"}');
+
+        // WHEN / THEN
+        self::assertTrue($validator->validate('2028-03-01T00:00:00Z', $schema)->isEmpty());
+        self::assertFalse($validator->validate('2028-02-28T00:00:00Z', $schema)->isEmpty());
+    }
+
+    #[DataProvider('daysThatDoNotExist')]
+    public function testADateTimeBoundShapedRightWithADayThatDoesNotExistIsRefused(string $bound): void
     {
         // GIVEN a bound that passes for one at a glance
         $validator = new OpisSchemaValidator();
-        $schema = Schema::fromJson('{"type": "string", "format": "date-time", "formatMinimum": "2026-13-01T00:00:00Z"}');
+        $schema = Schema::fromJson(\sprintf('{"type": "string", "format": "date-time", "formatMinimum": "%s"}', $bound));
 
-        // WHEN / THEN the shape is not the whole of it: there is no such month,
-        // so there is no moment to compare anything against
+        // WHEN / THEN the shape is not the whole of it: there is no such day, so
+        // there is no moment to compare anything against
         $this->expectException(ParseException::class);
 
         $validator->validate('2026-06-15T12:00:00Z', $schema);
@@ -282,6 +314,9 @@ final class DateBoundsTest extends TestCase
         yield 'a reading on a wall, with no offset to place it' => ['2026-06-15T12:00:00', null];
         yield 'and one that would be out of range if it were a moment' => ['2099-06-15T12:00:00', null];
         yield 'a month that does not exist' => ['2026-13-01T00:00:00Z', 'schema.format'];
+        // Shaped right, and no such day: this one is left to `format` as well,
+        // and never rolled over into the day after it.
+        yield 'the thirtieth of February' => ['2026-02-30T00:00:00Z', 'schema.format'];
     }
 
     #[DataProvider('moments')]

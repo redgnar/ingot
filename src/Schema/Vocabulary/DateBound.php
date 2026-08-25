@@ -22,8 +22,11 @@ namespace Ingot\Schema\Vocabulary;
  */
 final class DateBound
 {
-    /** RFC 3339, with the seconds it requires and the fraction it allows. */
-    private const string RFC3339 = '/^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/';
+    /**
+     * RFC 3339, with the seconds it requires and the fraction it allows. The day
+     * is captured because the shape alone does not say it exists.
+     */
+    private const string RFC3339 = '/^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/';
 
     private static function isCalendarDate(string $value): bool
     {
@@ -34,14 +37,21 @@ final class DateBound
 
     private static function isDateTime(string $value): bool
     {
-        if (preg_match(self::RFC3339, $value) !== 1) {
+        if (preg_match(self::RFC3339, $value, $parts) !== 1) {
+            return false;
+        }
+
+        // The shape says nothing about whether the day is there, and the two
+        // ways of not being there are not alike: PHP refuses a thirteenth month
+        // and quietly rolls the thirtieth of February over into March, which
+        // would be compared as though somebody had written it.
+        if (!checkdate((int) $parts['month'], (int) $parts['day'], (int) $parts['year'])) {
             return false;
         }
 
         try {
             self::moment($value);
         } catch (\Exception) {
-            // The shape was right and the day was not: 2026-13-01T00:00:00Z.
             return false;
         }
 

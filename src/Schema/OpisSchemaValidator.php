@@ -28,6 +28,14 @@ use Opis\JsonSchema\Validator;
  * `"format": "date-time"` string, which
  * standard JSON Schema cannot express at all ({@see DateBoundKeyword}).
  *
+ * `properties` gets one too, for the opposite reason. A subschema that refuses a
+ * member outright — `{"properties": {"nip": false}}`, which is how a schema says
+ * "not this one, not here" — has nothing inside it to report, so opis raises
+ * `properties` on the *owning object* and names the member in its arguments. At
+ * the object's own pointer that finding says only "something in here is wrong";
+ * at the member's it says which. Every other finding in this library points at
+ * the thing that is wrong, so this one does too.
+ *
  * `additionalProperties` gets one extra step. opis reports it once on the
  * owning object, listing every member it did not evaluate — and it stops
  * counting properties as evaluated as soon as one of them fails, so that list
@@ -42,6 +50,12 @@ final class OpisSchemaValidator implements SchemaValidator
 {
     /** The keyword opis raises for members an object schema did not evaluate. */
     private const string UNEXPECTED_MEMBERS = 'additionalProperties';
+
+    /**
+     * The keyword opis raises when a member's own subschema refused it without
+     * reporting anything of its own — which is what a `false` subschema does.
+     */
+    private const string REFUSED_MEMBER = 'properties';
 
     private const string UNEXPECTED_MEMBERS_CODE = 'schema.' . self::UNEXPECTED_MEMBERS;
 
@@ -115,6 +129,10 @@ final class OpisSchemaValidator implements SchemaValidator
             return self::missingMembers($error, $path);
         }
 
+        if ($error->keyword() === self::REFUSED_MEMBER && \is_string($error->args()['property'] ?? null)) {
+            return self::refusedMember($error, $path);
+        }
+
         return [new MappingError(
             JsonPointer::fromSegments($path),
             \sprintf('schema.%s', $error->keyword()),
@@ -171,6 +189,38 @@ final class OpisSchemaValidator implements SchemaValidator
         }
 
         return $errors;
+    }
+
+    /**
+     * A member its own subschema refused, reported under its own name.
+     *
+     * `{"properties": {"nip": false}}` is how a schema says a member must not be
+     * there — a condition's `else` branch is the shape that needs it — and a
+     * `false` subschema has nothing inside it to raise a finding, so opis raises
+     * `properties` on the object and puts the member's name in the arguments.
+     * Left there, a page would have a message and nowhere to put it.
+     *
+     * Only the single-member form is unpacked here: opis uses the same keyword
+     * for the *parent* of a member that failed its own subschema, and that one
+     * arrives with sub-errors, so it never reaches this method.
+     *
+     * @param list<int|string> $path pointer of the object carrying the member
+     *
+     * @return list<MappingError>
+     */
+    private static function refusedMember(ValidationError $error, array $path): array
+    {
+        /** @var string $member opis names the member its subschema refused */
+        $member = $error->args()['property'];
+        /** @var array<string, mixed> $object the keyword only ever fires on objects */
+        $object = (array) $error->data()->value();
+
+        return [new MappingError(
+            JsonPointer::fromSegments([...$path, $member]),
+            'schema.' . self::REFUSED_MEMBER,
+            \sprintf('The property "%s" is not allowed here.', $member),
+            $object[$member] ?? null,
+        )];
     }
 
     /**

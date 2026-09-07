@@ -149,6 +149,86 @@ final class OpisSchemaValidatorTest extends TestCase
         self::assertSame('/other', $report->errors[1]->pointer->toString());
     }
 
+    public function testAMemberItsOwnSubschemaRefusedIsReportedWhereItSits(): void
+    {
+        // GIVEN a schema that refuses one member outright — `false` is how a
+        // schema says "not this one, not here", and it is the shape a condition's
+        // `else` branch needs
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "object", "properties": {"id": {"type": "string"}, "nip": false}}');
+        $document = $this->decode('{"id": "form-1", "nip": "1234567890"}');
+
+        // WHEN
+        $report = $validator->validate($document, $schema);
+
+        // THEN it is named at its own pointer, carrying the value that was not
+        // allowed. A `false` subschema has nothing inside it to report, so opis
+        // raises `properties` on the owning object and names the member in its
+        // arguments; left there, whoever reads this would have a complaint and
+        // nowhere to put it
+        self::assertCount(1, $report);
+        self::assertSame('/nip', $report->errors[0]->pointer->toString());
+        self::assertSame('schema.properties', $report->errors[0]->code);
+        self::assertSame('1234567890', $report->errors[0]->input);
+    }
+
+    public function testARefusedMemberInsideAConditionKeepsItsFullPointer(): void
+    {
+        // GIVEN the shape a conditional definition derives: this member is asked
+        // only when another answer says so, and must be absent otherwise
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{
+            "type": "object",
+            "properties": {
+                "lines": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {"kind": {"enum": ["dent", "other"]}, "why": {"type": "string"}},
+                    "allOf": [{
+                        "if": {"properties": {"kind": {"const": "other"}}, "required": ["kind"]},
+                        "then": {"required": ["why"]},
+                        "else": {"properties": {"why": false}}
+                    }]
+                }}
+            }
+        }');
+        $document = $this->decode('{"lines": [{"kind": "other"}, {"kind": "dent", "why": "nothing"}]}');
+
+        // WHEN
+        $report = $validator->validate($document, $schema);
+
+        // THEN both findings name the entry they are about, which is what lets
+        // somebody put a message in the right row of a list
+        $found = [];
+
+        foreach ($report->errors as $error) {
+            $found[] = $error->pointer->toString() . ' ' . $error->code;
+        }
+
+        self::assertSame(['/lines/0/why schema.required', '/lines/1/why schema.properties'], $found);
+    }
+
+    public function testOnlyTheKeywordThatRefusesAMemberIsUnpackedThatWay(): void
+    {
+        // GIVEN a schema whose complaint is about a *different* member than the
+        // one it names: `dependentRequired` says "since `a` is here, `b` has to
+        // be", and opis reports it with `a` in its arguments — the same argument
+        // name a refused member arrives under
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "object", "dependentRequired": {"a": ["b"]}}');
+        $document = $this->decode('{"a": 1}');
+
+        // WHEN
+        $report = $validator->validate($document, $schema);
+
+        // THEN it is left as it came. Unpacking it would put "the property a is
+        // not allowed here" on a member the schema asked for, about a member that
+        // is missing — the argument's name is not enough to know what a finding
+        // means
+        self::assertCount(1, $report);
+        self::assertSame('', $report->errors[0]->pointer->toString());
+        self::assertSame('schema.dependentRequired', $report->errors[0]->code);
+    }
+
     public function testAMemberThatBrokeItsOwnRuleIsNotAlsoCalledUnexpected(): void
     {
         // GIVEN a declared member with a value its subschema refuses. opis

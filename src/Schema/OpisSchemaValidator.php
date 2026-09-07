@@ -36,6 +36,16 @@ use Opis\JsonSchema\Validator;
  * at the member's it says which. Every other finding in this library points at
  * the thing that is wrong, so this one does too.
  *
+ * And a refused document is looked at more than once, because opis reports a
+ * schema level in *phases* — the keywords of one phase together, then nothing
+ * more once a phase has failed — and `allOf` stops at the first branch that
+ * did not hold. So a document missing a member never heard about the
+ * obligations an `allOf` branch would have named, and a document failing two
+ * branches heard about one. Every branch of a conjunction is an independent
+ * obligation, so each is asked on its own and the answers are merged
+ * ({@see conjunction()}). Only when the document is refused: an accepted one
+ * has nothing to report and costs exactly what it costs today.
+ *
  * `additionalProperties` gets one extra step. opis reports it once on the
  * owning object, listing every member it did not evaluate — and it stops
  * counting properties as evaluated as soon as one of them fails, so that list
@@ -59,12 +69,21 @@ final class OpisSchemaValidator implements SchemaValidator
 
     private const string UNEXPECTED_MEMBERS_CODE = 'schema.' . self::UNEXPECTED_MEMBERS;
 
+    /**
+     * How deep a chain of conjunctions is followed. `allOf` inside `allOf` is
+     * ordinary in a generated schema; a hundred levels of it is not, and a
+     * refused document is not the moment to find out.
+     */
+    private const int MAX_CONJUNCTION_DEPTH = 10;
+
     private readonly Validator $validator;
     private readonly ErrorFormatter $formatter;
     private readonly SchemaDocumentPool $pool;
+    private readonly int $maxErrors;
 
     public function __construct(int $maxErrors = 100)
     {
+        $this->maxErrors = $maxErrors;
         // The parser is built here rather than taken by default because of the
         // extra vocabulary: `formatMinimum` and `formatMaximum` are what the
         // ecosystem uses to bound a date, and a schema carrying them should be
@@ -82,13 +101,156 @@ final class OpisSchemaValidator implements SchemaValidator
     {
         // Content-identical schemas resolve to one canonical \stdClass, so the
         // opis loader's identity cache parses each distinct schema only once.
-        $error = $this->validator->validate($document, $this->pool->canonical($schema))->error();
+        $findings = $this->findings($document, $this->pool->canonical($schema), 0);
+
+        return $findings === [] ? ErrorReport::none() : ErrorReport::of(...$findings);
+    }
+
+    /**
+     * Everything wrong with this document under this schema — the first answer,
+     * plus what each branch of a conjunction says when asked on its own.
+     *
+     * A branch of an `allOf` applies to the same instance as the schema holding
+     * it, which is what makes this a second *question* rather than a second
+     * traversal: nothing has to be re-pointed, because the answers already come
+     * back at the same absolute pointers.
+     *
+     * @return list<MappingError>
+     */
+    private function findings(mixed $document, \stdClass|bool $schema, int $depth): array
+    {
+        $error = $this->validator->validate($document, $schema)->error();
 
         if ($error === null) {
-            return ErrorReport::none();
+            return [];
         }
 
-        return ErrorReport::of(...$this->collectLeaves($error));
+        $findings = $this->collectLeaves($error);
+        $branches = self::conjunction($schema, $depth);
+
+        // The ceiling bounds the work as well as the report: a document that has
+        // already said enough is not asked the rest.
+        while ($branches !== [] && \count($findings) < $this->maxErrors) {
+            $findings = self::merge($findings, $this->findings($document, array_shift($branches), $depth + 1));
+        }
+
+        return $findings;
+    }
+
+    /**
+     * The branches worth asking on their own: the members of an `allOf`, which
+     * is the one applicator whose every branch has to hold — so every branch
+     * that did not hold is a finding somebody has to act on. `anyOf` and
+     * `oneOf` are left alone on purpose: there a branch failing is not a
+     * failure at all, and reporting one would be reporting the road not taken.
+     *
+     * A branch is skipped when it depends on the document around it
+     * ({@see standsOnItsOwn()}), because then the answer to it alone would be
+     * an answer to a different question. What the schema *holding* the branches
+     * says needs no such check: asking a branch cannot make it more permissive,
+     * so a parent's own `unevaluatedProperties` — or anything else it carries —
+     * has no bearing on whether its branches held.
+     *
+     * @return list<\stdClass>
+     */
+    private static function conjunction(\stdClass|bool $schema, int $depth): array
+    {
+        if ($depth >= self::MAX_CONJUNCTION_DEPTH || !$schema instanceof \stdClass) {
+            return [];
+        }
+
+        /** @var mixed $allOf */
+        $allOf = $schema->allOf ?? null;
+
+        if (!\is_array($allOf)) {
+            return [];
+        }
+
+        $branches = [];
+
+        /** @var mixed $branch */
+        foreach ($allOf as $branch) {
+            if ($branch instanceof \stdClass && self::standsOnItsOwn($branch)) {
+                $branches[] = $branch;
+            }
+        }
+
+        return $branches;
+    }
+
+    /**
+     * Whether this subschema means the same thing away from the document it was
+     * written in.
+     *
+     * Anything spelled with a `$` is resolved against that document — a `$ref`
+     * naming a `$defs` entry, an `$id` that moves the base URI, an anchor — and
+     * `unevaluatedProperties` / `unevaluatedItems` are answered by annotations
+     * the surroundings collected. A branch carrying either, anywhere inside it,
+     * is left to opis to report the way it always did: an incomplete answer is
+     * a great deal better than a wrong one.
+     */
+    private static function standsOnItsOwn(\stdClass $branch): bool
+    {
+        /** @var mixed $value */
+        foreach (get_object_vars($branch) as $key => $value) {
+            if (str_starts_with((string) $key, '$') || $key === 'unevaluatedProperties' || $key === 'unevaluatedItems') {
+                return false;
+            }
+
+            foreach ($value instanceof \stdClass ? [$value] : (\is_array($value) ? $value : []) as $nested) {
+                if ($nested instanceof \stdClass && !self::standsOnItsOwn($nested)) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * The first answer, then whatever a branch added to it. A branch that
+     * repeats what has already been said adds nothing: the same pointer, the
+     * same code and the same value is the same finding, however many ways there
+     * were to arrive at it.
+     *
+     * @param list<MappingError> $findings
+     * @param list<MappingError> $more
+     *
+     * @return list<MappingError>
+     */
+    private static function merge(array $findings, array $more): array
+    {
+        foreach ($more as $finding) {
+            if (!self::alreadySaid($findings, $finding)) {
+                $findings[] = $finding;
+            }
+        }
+
+        return $findings;
+    }
+
+    /**
+     * @param list<MappingError> $findings
+     */
+    private static function alreadySaid(array $findings, MappingError $candidate): bool
+    {
+        foreach ($findings as $finding) {
+            if (self::fingerprint($finding) === self::fingerprint($candidate)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function fingerprint(MappingError $finding): string
+    {
+        return \sprintf(
+            '%s %s %s',
+            $finding->pointer->toString(),
+            $finding->code,
+            json_encode($finding->input, \JSON_PARTIAL_OUTPUT_ON_ERROR),
+        );
     }
 
     /**

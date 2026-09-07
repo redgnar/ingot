@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ingot\Tests\Schema;
 
+use Ingot\Error\MappingError;
 use Ingot\Schema\OpisSchemaValidator;
 use Ingot\Schema\Schema;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -381,6 +382,335 @@ final class OpisSchemaValidatorTest extends TestCase
 
         // THEN
         self::assertTrue($report->isEmpty());
+    }
+
+    public function testAMissingMemberDoesNotHideWhatAConditionWouldHaveAsked(): void
+    {
+        // GIVEN a schema with an obligation of its own and one that a condition
+        // brings about — the shape a generated schema has, and a document that
+        // fails both
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "company"},
+                    "name": {"type": "string"},
+                    "taxNumber": {"type": "string"}
+                },
+                "required": ["name"],
+                "allOf": [
+                    {
+                        "if": {"required": ["kind"], "properties": {"kind": {"const": "company"}}},
+                        "then": {"required": ["taxNumber"]}
+                    }
+                ]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{"kind": "company"}'), $schema);
+
+        // THEN both are reported. opis takes a schema level in phases and stops
+        // after the phase that failed, so the missing `name` used to be the
+        // whole answer — and a client fixing it would then be told about
+        // `taxNumber`, one obligation per attempt
+        self::assertCount(2, $report);
+        self::assertSame(['/name', '/taxNumber'], array_map(
+            static fn(MappingError $error): string => $error->pointer->toString(),
+            $report->errors,
+        ));
+        self::assertSame(['schema.required', 'schema.required'], array_map(
+            static fn(MappingError $error): string => $error->code,
+            $report->errors,
+        ));
+    }
+
+    public function testEveryBranchOfAConjunctionThatDidNotHoldIsReported(): void
+    {
+        // GIVEN two obligations, each under a condition of its own, and a
+        // document that brings both about and answers neither
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "properties": {
+                    "company": {"type": "boolean"},
+                    "reported": {"type": "boolean"},
+                    "taxNumber": {"type": "string"},
+                    "caseNumber": {"type": "string"}
+                },
+                "allOf": [
+                    {
+                        "if": {"required": ["company"], "properties": {"company": {"const": true}}},
+                        "then": {"required": ["taxNumber"]}
+                    },
+                    {
+                        "if": {"required": ["reported"], "properties": {"reported": {"const": true}}},
+                        "then": {"required": ["caseNumber"]}
+                    }
+                ]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{"company": true, "reported": true}'), $schema);
+
+        // THEN both, and each once: `allOf` itself stops at the first branch
+        // that did not hold, so the second used to be invisible until the first
+        // was answered
+        self::assertCount(2, $report);
+        self::assertSame(['/taxNumber', '/caseNumber'], array_map(
+            static fn(MappingError $error): string => $error->pointer->toString(),
+            $report->errors,
+        ));
+    }
+
+    public function testAConjunctionInsideAConjunctionIsAskedToo(): void
+    {
+        // GIVEN a branch that is itself a conjunction — which is what a
+        // generated schema looks like once a rule is composed out of two
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                "allOf": [
+                    {"allOf": [{"required": ["a"]}, {"required": ["b"]}]}
+                ]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{}'), $schema);
+
+        // THEN
+        self::assertCount(2, $report);
+        self::assertSame(['/a', '/b'], array_map(
+            static fn(MappingError $error): string => $error->pointer->toString(),
+            $report->errors,
+        ));
+    }
+
+    public function testAnAlternativeIsNotTakenApart(): void
+    {
+        // GIVEN a document that has to match one of two shapes and matches
+        // neither
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "anyOf": [{"required": ["a"]}, {"required": ["b"]}]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{}'), $schema);
+
+        // THEN the report is opis's own, and nothing is added to it: a branch of
+        // an `anyOf` that did not hold is not an obligation, so asking each one
+        // separately would be reporting the road not taken. What opis itself
+        // says about an alternative — one finding per branch, here `a` and `b`
+        // for a document that needs only one of them — is left exactly as it
+        // was; that is a question about alternatives, not about completeness
+        self::assertCount(2, $report);
+        self::assertSame(['/a', '/b'], array_map(
+            static fn(MappingError $error): string => $error->pointer->toString(),
+            $report->errors,
+        ));
+    }
+
+    public function testABranchThatNamesSomethingInTheDocumentAroundItIsLeftAlone(): void
+    {
+        // GIVEN a branch whose rule lives in `$defs` — which is resolved against
+        // the document it was written in, so the branch means nothing on its own
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "$defs": {"named": {"required": ["name"]}},
+                "required": ["kind"],
+                "allOf": [{"$ref": "#/$defs/named"}]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{}'), $schema);
+
+        // THEN what opis said, and nothing invented: an incomplete answer is a
+        // great deal better than one arrived at by asking a different question
+        self::assertCount(1, $report);
+        self::assertSame('/kind', $report->errors[0]->pointer->toString());
+    }
+
+    public function testABranchWhoseSurroundingsDecideWhatWasEvaluatedIsLeftAlone(): void
+    {
+        // GIVEN a branch carrying `unevaluatedProperties`, which is answered by
+        // annotations the *surroundings* collected: here the `name` its parent
+        // declares. Alone, the branch sees nothing evaluated
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"name": {"type": "string"}},
+                "allOf": [{"unevaluatedProperties": false}]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{"name": "Ada"}'), $schema);
+
+        // THEN one finding, opis's own — asked on its own, that branch would
+        // have called `name` a property that is not allowed
+        self::assertCount(1, $report);
+        self::assertSame('schema.required', $report->errors[0]->code);
+        self::assertSame('/kind', $report->errors[0]->pointer->toString());
+    }
+
+    public function testTheSameHoldsForAListAndItsUnevaluatedItems(): void
+    {
+        // GIVEN the same thing about a list
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "array",
+                "minItems": 3,
+                "prefixItems": [{"type": "string"}],
+                "allOf": [{"unevaluatedItems": false}]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('["a"]'), $schema);
+
+        // THEN one finding, and not a word about the item the branch on its own
+        // would have called unevaluated
+        self::assertCount(1, $report);
+        self::assertSame('schema.minItems', $report->errors[0]->code);
+    }
+
+    public function testABranchThatDecidesForItselfWhatWasEvaluatedIsLeftAloneToo(): void
+    {
+        // GIVEN a branch carrying `unevaluatedProperties` — inside the branch
+        // this time, where taking it out of its `allOf` changes which
+        // annotations it can see
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"name": {"type": "string"}},
+                "allOf": [{"unevaluatedProperties": false}]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{"name": "Ada"}'), $schema);
+
+        // THEN what opis said, and nothing arrived at by asking the branch a
+        // question it cannot answer alone
+        self::assertCount(1, $report);
+        self::assertSame('/kind', $report->errors[0]->pointer->toString());
+    }
+
+    public function testABranchIsLeftAloneWhereverInsideItTheReferenceSits(): void
+    {
+        // GIVEN two branches naming rules out of `$defs` — one inside a list of
+        // subschemas, one under a keyword — each asking for a different member,
+        // so a branch asked by mistake would be heard
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "$defs": {
+                    "named": {"required": ["name"]},
+                    "aged": {"required": ["age"]}
+                },
+                "required": ["id"],
+                "allOf": [
+                    {"allOf": [{"$ref": "#/$defs/named"}]},
+                    {"if": {"required": ["kind"]}, "then": {"$ref": "#/$defs/aged"}}
+                ]
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{"kind": "x"}'), $schema);
+
+        // THEN the missing `id` is the whole answer: neither branch was asked.
+        // A reference means what the document around it says, and whether it
+        // even resolves away from that document depends on what the validator
+        // happens to have parsed already — which must never decide whether
+        // somebody's document is refused
+        self::assertCount(1, $report);
+        self::assertSame('/id', $report->errors[0]->pointer->toString());
+    }
+
+    public function testWhatABranchRepeatsIsSaidOnce(): void
+    {
+        // GIVEN a single branch that is also the first thing to fail, so the
+        // first answer and the branch's own answer are the same finding
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "object", "allOf": [{"required": ["a"]}]}');
+
+        // WHEN
+        $report = $validator->validate($this->decode('{}'), $schema);
+
+        // THEN
+        self::assertCount(1, $report);
+        self::assertSame('/a', $report->errors[0]->pointer->toString());
+        self::assertSame('schema.required', $report->errors[0]->code);
+    }
+
+    public function testAChainOfConjunctionsIsFollowedOnlySoFar(): void
+    {
+        // GIVEN a schema whose conjunctions nest twelve deep, each level asking
+        // for a member of its own. Branches multiply, so a chain nobody bounded
+        // is a document that costs more to refuse the deeper somebody wrote it
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(self::nestedConjunctions(12));
+
+        // WHEN a document answering none of them is judged
+        $report = $validator->validate($this->decode('{}'), $schema);
+
+        // THEN eleven levels are named — the ten that were followed, and the
+        // one they arrived at — and the twelfth is left to the attempt after
+        // this one, which is what a ceiling is for
+        self::assertCount(11, $report);
+        self::assertSame('/m0', $report->errors[0]->pointer->toString());
+        self::assertSame('/m10', $report->errors[10]->pointer->toString());
+    }
+
+    public function testTheReportStopsAtTheCeilingItWasGiven(): void
+    {
+        // GIVEN a validator told to collect one finding, and a document that
+        // fails two independent obligations
+        $validator = new OpisSchemaValidator(maxErrors: 1);
+        $schema = Schema::fromJson('{"type": "object", "allOf": [{"required": ["a"]}, {"required": ["b"]}]}');
+
+        // WHEN
+        $report = $validator->validate($this->decode('{}'), $schema);
+
+        // THEN the second branch is not asked at all: the ceiling is a ceiling
+        // on work as much as on findings
+        self::assertCount(1, $report);
+        self::assertSame('/a', $report->errors[0]->pointer->toString());
+    }
+
+    /**
+     * `{"required": ["m0"], "allOf": [{"required": ["m1"], "allOf": [ … ]}]}` —
+     * a conjunction per level, each asking for a member named after its depth.
+     */
+    private static function nestedConjunctions(int $levels): string
+    {
+        $schema = \sprintf('{"required": ["m%d"]}', $levels - 1);
+
+        for ($level = $levels - 2; $level >= 0; --$level) {
+            $schema = \sprintf('{"required": ["m%d"], "allOf": [%s]}', $level, $schema);
+        }
+
+        return $schema;
     }
 
     private function decode(string $json): mixed

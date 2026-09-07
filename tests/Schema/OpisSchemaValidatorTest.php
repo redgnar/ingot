@@ -507,17 +507,20 @@ final class OpisSchemaValidatorTest extends TestCase
         // WHEN
         $report = $validator->validate($this->decode('{}'), $schema);
 
-        // THEN the report is opis's own, and nothing is added to it: a branch of
-        // an `anyOf` that did not hold is not an obligation, so asking each one
-        // separately would be reporting the road not taken. What opis itself
-        // says about an alternative — one finding per branch, here `a` and `b`
-        // for a document that needs only one of them — is left exactly as it
-        // was; that is a question about alternatives, not about completeness
-        self::assertCount(2, $report);
-        self::assertSame(['/a', '/b'], array_map(
-            static fn(MappingError $error): string => $error->pointer->toString(),
-            $report->errors,
-        ));
+        // THEN one finding, about the value that fits nothing — and not one per
+        // branch. A branch of an `anyOf` that did not hold is a road not taken:
+        // reported as a finding of its own it says "add `a`" *and* "add `b`"
+        // about a document that needs one of them, which is two instructions
+        // that are each wrong
+        self::assertCount(1, $report);
+        self::assertSame('', $report->errors[0]->pointer->toString());
+        self::assertSame('schema.anyOf', $report->errors[0]->code);
+        // What each alternative wanted is in the message, where a reader can
+        // weigh them: the only thing anybody can do with alternatives
+        self::assertSame(
+            'The value matches none of the 2 alternatives: (1) /a "a" is required; (2) /b "b" is required',
+            $report->errors[0]->message,
+        );
     }
 
     public function testABranchThatNamesSomethingInTheDocumentAroundItIsLeftAlone(): void
@@ -711,6 +714,72 @@ final class OpisSchemaValidatorTest extends TestCase
         }
 
         return $schema;
+    }
+
+    public function testAnAlternativeInsideAMemberIsAboutThatMember(): void
+    {
+        // GIVEN a member that has to match one of two shapes and matches neither
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson(<<<'JSON'
+            {
+                "type": "object",
+                "properties": {
+                    "payment": {"anyOf": [{"required": ["card"]}, {"required": ["transfer"]}]}
+                }
+            }
+            JSON);
+
+        // WHEN
+        $report = $validator->validate($this->decode('{"payment": {}}'), $schema);
+
+        // THEN the finding is about the payment, not about `card` and not about
+        // `transfer`: nothing is missing at either of those, the value is what
+        // matches nothing on offer
+        self::assertCount(1, $report);
+        self::assertSame('/payment', $report->errors[0]->pointer->toString());
+        self::assertSame('schema.anyOf', $report->errors[0]->code);
+        self::assertStringContainsString('/payment/card "card" is required', $report->errors[0]->message);
+        self::assertStringContainsString('/payment/transfer "transfer" is required', $report->errors[0]->message);
+    }
+
+    public function testAnAmbiguousDocumentIsToldSoRatherThanShownTheAlternatives(): void
+    {
+        // GIVEN a `oneOf` that two of the alternatives match
+        $validator = new OpisSchemaValidator();
+        $schema = Schema::fromJson('{"type": "object", "oneOf": [{"required": ["a"]}, {"required": ["a"]}]}');
+
+        // WHEN
+        $report = $validator->validate($this->decode('{"a": 1}'), $schema);
+
+        // THEN the complaint is the ambiguity. Naming what the alternatives
+        // wanted would be absurd here: the document *has* all of it, and what is
+        // wrong is that it matches more than one shape
+        self::assertCount(1, $report);
+        self::assertSame('schema.oneOf', $report->errors[0]->code);
+        self::assertSame('The value matches 2 of the alternatives, and it may match only one.', $report->errors[0]->message);
+    }
+
+    public function testAMessageNamesOnlySoManyAlternatives(): void
+    {
+        // GIVEN seven shapes to choose from and a document that fits none
+        $validator = new OpisSchemaValidator();
+        $shapes = implode(', ', array_map(
+            static fn(int $index): string => \sprintf('{"required": ["m%d"]}', $index),
+            range(1, 7),
+        ));
+        $schema = Schema::fromJson(\sprintf('{"type": "object", "anyOf": [%s]}', $shapes));
+
+        // WHEN
+        $report = $validator->validate($this->decode('{}'), $schema);
+
+        // THEN five are named and the rest are counted: a reader who cannot
+        // weigh five will not weigh twenty, and a message nobody can read is a
+        // message that costs memory for nothing
+        self::assertCount(1, $report);
+        self::assertStringContainsString('none of the 7 alternatives', $report->errors[0]->message);
+        self::assertStringContainsString('(5) /m5 "m5" is required', $report->errors[0]->message);
+        self::assertStringNotContainsString('(6)', $report->errors[0]->message);
+        self::assertStringContainsString('and 2 more', $report->errors[0]->message);
     }
 
     private function decode(string $json): mixed

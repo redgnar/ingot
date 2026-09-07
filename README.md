@@ -112,6 +112,25 @@ comparison exact; timestamps with offsets do not, so a bound beside any other
 format is refused when the schema is read, along with a bound that is not a
 whole calendar date (`2026-02-30` included).
 
+**Every finding points at the thing that is wrong**, and three keywords need help
+with that. `required` and `additionalProperties` are reported by JSON Schema per
+*object*, so they are unpacked into one finding per member — `/email` rather than
+`''`. A member a subschema refused outright (`{"properties": {"nip": false}}`, the
+shape a conditional document needs) is named the same way. And `anyOf` / `oneOf`
+go the other way: their sub-errors are the roads not taken, so an alternative is
+**one** finding at the value that fitted nothing, with what each shape wanted in
+the message — reported per branch it would say "add `card`" *and* "add `transfer`"
+about a value that needs one of them.
+
+A refused document is also looked at more than once. opis reports a schema level
+in phases and stops after the phase that failed, and `allOf` stops at the first
+branch that did not hold; so each branch of a conjunction is asked on its own and
+the answers merge, which is what makes a document with three independent problems
+report three rather than one. Only on refusal — an accepted document pays
+nothing — and never for a branch that names something in the document around it
+(a `$ref`, `unevaluatedProperties`), which away from that document would be a
+different question.
+
 Schemas can also be resolved dynamically — by convention, from plugins, or by
 document content (the versioning hook) — and overridden per call:
 

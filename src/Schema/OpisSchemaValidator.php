@@ -36,6 +36,14 @@ use Opis\JsonSchema\Validator;
  * at the member's it says which. Every other finding in this library points at
  * the thing that is wrong, so this one does too.
  *
+ * `anyOf` and `oneOf` get the opposite treatment to everything else here. Their
+ * sub-errors are the roads *not* taken: a document that had to match one of two
+ * shapes and matched neither is not two problems, and reported as two it says
+ * "add `card`" and "add `transfer`" about a value that needs one of them. So an
+ * alternative is **one** finding, at the value no shape fitted, and what each
+ * shape wanted goes into the message — where a reader can weigh them, which is
+ * the only thing anybody can do with alternatives.
+ *
  * And a refused document is looked at more than once, because opis reports a
  * schema level in *phases* — the keywords of one phase together, then nothing
  * more once a phase has failed — and `allOf` stops at the first branch that
@@ -60,6 +68,17 @@ final class OpisSchemaValidator implements SchemaValidator
 {
     /** The keyword opis raises for members an object schema did not evaluate. */
     private const string UNEXPECTED_MEMBERS = 'additionalProperties';
+
+    /**
+     * The two keywords whose sub-errors are alternatives rather than problems.
+     *
+     * `allOf` is deliberately not here: every one of its branches has to hold,
+     * so each that did not is a finding of its own ({@see conjunction()}).
+     */
+    private const array ALTERNATIVES = ['anyOf', 'oneOf'];
+
+    /** How many alternatives a message names before it stops: a reader who cannot weigh five will not weigh twenty. */
+    private const int ALTERNATIVES_NAMED = 5;
 
     /**
      * The keyword opis raises when a member's own subschema refused it without
@@ -261,6 +280,12 @@ final class OpisSchemaValidator implements SchemaValidator
         /** @var list<ValidationError> $subErrors opis/json-schema lacks generics in its PHPDoc */
         $subErrors = $error->subErrors();
 
+        // An alternative is one complaint about one value, and its sub-errors are
+        // what each shape would have wanted — not things to fix.
+        if (\in_array($error->keyword(), self::ALTERNATIVES, true)) {
+            return [$this->alternative($error, $subErrors)];
+        }
+
         if ($subErrors === []) {
             return $this->translate($error);
         }
@@ -301,6 +326,66 @@ final class OpisSchemaValidator implements SchemaValidator
             $this->message($error),
             $error->data()->value(),
         )];
+    }
+
+    /**
+     * A value no shape fitted, as one finding.
+     *
+     * The pointer is the value itself, because that is the thing that is wrong:
+     * nothing is missing at `/card` — the *payment* is what does not match
+     * anything on offer. What each shape wanted is named in the message, in the
+     * order the schema offers them, so a caller can choose one; a `oneOf` that
+     * matched more than one says that instead, since then the problem is not
+     * that nothing fits but that the document is ambiguous.
+     *
+     * @param list<ValidationError> $alternatives
+     */
+    private function alternative(ValidationError $error, array $alternatives): MappingError
+    {
+        /** @var list<int|string> $path */
+        $path = $error->data()->fullPath();
+        $matched = $error->args()['matched'] ?? [];
+
+        return new MappingError(
+            JsonPointer::fromSegments($path),
+            \sprintf('schema.%s', $error->keyword()),
+            // opis names the alternatives that matched, and it names them only
+            // when more than one did — so anything there at all is the ambiguity
+            // rather than a count to compare.
+            \is_array($matched) && $matched !== []
+                ? \sprintf('The value matches %d of the alternatives, and it may match only one.', \count($matched))
+                : $this->whatEachAlternativeWanted($alternatives),
+            $error->data()->value(),
+        );
+    }
+
+    /**
+     * @param list<ValidationError> $alternatives
+     */
+    private function whatEachAlternativeWanted(array $alternatives): string
+    {
+        $wanted = [];
+
+        foreach (\array_slice($alternatives, 0, self::ALTERNATIVES_NAMED) as $index => $alternative) {
+            $said = [];
+
+            foreach ($this->collectLeaves($alternative) as $leaf) {
+                // Without the trailing stop, because these are joined into one
+                // sentence and "is required.; (2)" reads like a typo.
+                $said[] = \sprintf('%s %s', $leaf->pointer->toString(), rtrim($leaf->message, '.'));
+            }
+
+            $wanted[] = \sprintf('(%d) %s', $index + 1, implode(' ', $said));
+        }
+
+        $more = \count($alternatives) - \count($wanted);
+
+        return \sprintf(
+            'The value matches none of the %d alternatives: %s%s',
+            \count($alternatives),
+            implode('; ', $wanted),
+            $more > 0 ? \sprintf('; and %d more', $more) : '',
+        );
     }
 
     /**
